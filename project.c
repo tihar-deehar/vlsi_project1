@@ -98,36 +98,43 @@ static void simulate_good(circuit_t *ckt, int *input_pat, int *values) {
     }
 }
 
-static void simulate_faulty(circuit_t *ckt, int *input_pat, int *values, fault_list_t *fault) {
-    int i, g, a, b, fault_val;
+static void simulate_faulty_from_good(circuit_t *ckt, int *good_values, int *values, fault_list_t *fault) {
+    int g, a, b, fault_val, start_g;
     gate_t *gate;
 
     fault_val = stuck_to_logic(fault->type);
 
-    for (i = 0; i < ckt->ngates; i++) {
-        values[i] = UNDEFINED;
+    /* Start from the already-correct good simulation */
+    memcpy(values, good_values, sizeof(int) * ckt->ngates);
+
+    start_g = fault->gate_index;
+
+    /* Special case: output stuck fault on a PI */
+    if (fault->input_index == -1 && ckt->gate[fault->gate_index].type == PI) {
+        values[fault->gate_index] = fault_val;
+        start_g = fault->gate_index + 1;
     }
 
-    for (i = 0; i < ckt->npi; i++) {
-        values[ckt->pi[i]] = input_pat[i];
-    }
-
-    for (g = 0; g < ckt->ngates; g++) {
+    for (g = start_g; g < ckt->ngates; g++) {
         gate = &ckt->gate[g];
 
         switch (gate->type) {
             case PI:
-              if (g == fault->gate_index && fault->input_index == -1) {
-                values[g] = fault_val;
-              }
-              break;
+                /* PIs already copied from good_values */
+                break;
 
             case PO_GND:
                 values[g] = LOGIC_0;
+                if (g == fault->gate_index && fault->input_index == -1) {
+                    values[g] = fault_val;
+                }
                 break;
 
             case PO_VCC:
                 values[g] = LOGIC_1;
+                if (g == fault->gate_index && fault->input_index == -1) {
+                    values[g] = fault_val;
+                }
                 break;
 
             case INV:
@@ -139,8 +146,11 @@ static void simulate_faulty(circuit_t *ckt, int *input_pat, int *values, fault_l
                     a = fault_val;
                 }
 
-                if (gate->type == PO) values[g] = a;
-                else values[g] = eval_gate(gate->type, a, LOGIC_X);
+                if (gate->type == PO) {
+                    values[g] = a;
+                } else {
+                    values[g] = eval_gate(gate->type, a, LOGIC_X);
+                }
 
                 if (g == fault->gate_index && fault->input_index == -1) {
                     values[g] = fault_val;
@@ -177,13 +187,66 @@ fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
      pattern_t *pat;
      fault_list_t *undetected_flist;
 {
+    int *good_all;
     int good_values[MAX_GATES];
     int bad_values[MAX_GATES];
-    int p, j, detected;
+    int p, j, g, detected;
     fault_list_t *prev, *curr, *next;
 
+    good_all = (int *)malloc(sizeof(int) * pat->len * ckt->ngates);
+    if (good_all == NULL) {
+        /* Fallback: keep old good simulation behavior if allocation fails */
+        for (p = 0; p < pat->len; p++) {
+            simulate_good(ckt, pat->in[p], good_values);
+
+            for (j = 0; j < ckt->npo; j++) {
+                pat->out[p][j] = good_values[ckt->po[j]];
+            }
+        }
+
+        prev = NULL;
+        curr = undetected_flist;
+
+        while (curr != NULL) {
+            detected = FALSE;
+
+            for (p = 0; p < pat->len && !detected; p++) {
+                simulate_good(ckt, pat->in[p], good_values);
+                simulate_faulty_from_good(ckt, good_values, bad_values, curr);
+
+                for (j = 0; j < ckt->npo; j++) {
+                    int good = good_values[ckt->po[j]];
+                    int bad  = bad_values[ckt->po[j]];
+
+                    if (good != LOGIC_X && bad != LOGIC_X && good != bad) {
+                        detected = TRUE;
+                        break;
+                    }
+                }
+            }
+
+            next = curr->next;
+
+            if (detected) {
+                if (prev == NULL) undetected_flist = next;
+                else prev->next = next;
+            } else {
+                prev = curr;
+            }
+
+            curr = next;
+        }
+
+        return(undetected_flist);
+    }
+
+    /* Precompute and store good gate values for every pattern */
     for (p = 0; p < pat->len; p++) {
         simulate_good(ckt, pat->in[p], good_values);
+
+        for (g = 0; g < ckt->ngates; g++) {
+            good_all[p * ckt->ngates + g] = good_values[g];
+        }
 
         for (j = 0; j < ckt->npo; j++) {
             pat->out[p][j] = good_values[ckt->po[j]];
@@ -197,10 +260,12 @@ fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
         detected = FALSE;
 
         for (p = 0; p < pat->len && !detected; p++) {
-            simulate_faulty(ckt, pat->in[p], bad_values, curr);
+            int *good_ptr = &good_all[p * ckt->ngates];
+
+            simulate_faulty_from_good(ckt, good_ptr, bad_values, curr);
 
             for (j = 0; j < ckt->npo; j++) {
-                int good = pat->out[p][j];
+                int good = good_ptr[ckt->po[j]];
                 int bad  = bad_values[ckt->po[j]];
 
                 if (good != LOGIC_X && bad != LOGIC_X && good != bad) {
@@ -222,5 +287,6 @@ fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
         curr = next;
     }
 
+    free(good_all);
     return(undetected_flist);
 }
