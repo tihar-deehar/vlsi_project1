@@ -2,266 +2,130 @@
 #include <stdlib.h>
 #include <string.h>
 #include "project.h"
-/*************************************************************************
 
-Function:  three_val_transition_fault_simulate
+/* * Strategy:
+ * 1. Pre-allocate static evaluation arrays to avoid malloc/free overhead[cite: 48].
+ * 2. Optimized Good Sim: Single pass through levelized gates[cite: 22].
+ * 3. Selective Fault Sim: Only re-evaluate gates in the fanout cone of the fault.
+ * 4. Activation Check: Skip faults that don't change the gate's local output[cite: 20].
+ */
 
-Purpose:  This function performs transition fault simulation on 3-valued
-          input patterns.
+static int good_vals[MAX_GATES];
+static int faulty_vals[MAX_GATES];
+static char affected[MAX_GATES]; 
 
-pat.out[][] is filled with the fault-free output patterns corresponding to
-the input patterns in pat.in[][].
-
-Return:  List of faults that remain undetected.
-
-*************************************************************************/
-static inline int inv3(int a) {
-    if (a == LOGIC_0) return LOGIC_1;
-    if (a == LOGIC_1) return LOGIC_0;
-    return LOGIC_X;
-}
-
-static inline int and3(int a, int b) {
-    if (a == LOGIC_0 || b == LOGIC_0) return LOGIC_0;
-    if (a == LOGIC_1 && b == LOGIC_1) return LOGIC_1;
-    return LOGIC_X;
-}
-
-static inline int or3(int a, int b) {
-    if (a == LOGIC_1 || b == LOGIC_1) return LOGIC_1;
-    if (a == LOGIC_0 && b == LOGIC_0) return LOGIC_0;
-    return LOGIC_X;
-}
-
-static inline int stuck_to_logic(stuck_val_t type) {
-    return (type == S_A_0) ? LOGIC_0 : LOGIC_1;
-}
-
-static inline int eval_gate(gate_type_t type, int a, int b) {
+static inline int eval_3val(gate_type_t type, int a, int b) {
     switch (type) {
-        case AND:  return and3(a, b);
-        case NAND: return inv3(and3(a, b));
-        case OR:   return or3(a, b);
-        case NOR:  return inv3(or3(a, b));
-        case INV:  return inv3(a);
+        case AND:  return (a == LOGIC_0 || b == LOGIC_0) ? LOGIC_0 : (a == LOGIC_1 && b == LOGIC_1) ? LOGIC_1 : LOGIC_X;
+        case OR:   return (a == LOGIC_1 || b == LOGIC_1) ? LOGIC_1 : (a == LOGIC_0 && b == LOGIC_0) ? LOGIC_0 : LOGIC_X;
+        case NAND: {
+            int res = (a == LOGIC_0 || b == LOGIC_0) ? LOGIC_0 : (a == LOGIC_1 && b == LOGIC_1) ? LOGIC_1 : LOGIC_X;
+            return (res == LOGIC_0) ? LOGIC_1 : (res == LOGIC_1) ? LOGIC_0 : LOGIC_X;
+        }
+        case NOR: {
+            int res = (a == LOGIC_1 || b == LOGIC_1) ? LOGIC_1 : (a == LOGIC_0 && b == LOGIC_0) ? LOGIC_0 : LOGIC_X;
+            return (res == LOGIC_0) ? LOGIC_1 : (res == LOGIC_1) ? LOGIC_0 : LOGIC_X;
+        }
+        case INV:  return (a == LOGIC_0) ? LOGIC_1 : (a == LOGIC_1) ? LOGIC_0 : LOGIC_X;
         case BUF:  return a;
-        default:   return UNDEFINED;
+        case PO:   return a;
+        default:   return LOGIC_X;
     }
 }
 
-static void simulate_good(circuit_t *ckt, int *input_pat, int *values) {
-    int i, g, a, b;
-    gate_t *gate;
-
-    for (i = 0; i < ckt->ngates; i++) {
-        values[i] = UNDEFINED;
-    }
-
-    for (i = 0; i < ckt->npi; i++) {
-        values[ckt->pi[i]] = input_pat[i];
-    }
-
-    for (g = 0; g < ckt->ngates; g++) {
-        gate = &ckt->gate[g];
-
-        switch (gate->type) {
-            case PI:
-                break;
-
-            case PO_GND:
-                values[g] = LOGIC_0;
-                break;
-
-            case PO_VCC:
-                values[g] = LOGIC_1;
-                break;
-
-            case INV:
-            case BUF:
-            case PO:
-                a = values[gate->fanin[0]];
-                if (gate->type == PO) values[g] = a;
-                else values[g] = eval_gate(gate->type, a, LOGIC_X);
-                break;
-
-            case AND:
-            case OR:
-            case NAND:
-            case NOR:
-                a = values[gate->fanin[0]];
-                b = values[gate->fanin[1]];
-                values[g] = eval_gate(gate->type, a, b);
-                break;
-
-            default:
-                break;
-        }
-    }
-}
-
-static void simulate_faulty_from_good(circuit_t *ckt, int *good_values, int *values, fault_list_t *fault) {
-    int g, a, b, fault_val, start_g;
-    gate_t *gate;
-
-    fault_val = stuck_to_logic(fault->type);
-
-    /* Start from the already-correct good simulation */
-    memcpy(values, good_values, sizeof(int) * ckt->ngates);
-
-    start_g = fault->gate_index;
-
-    /* Special case: output stuck fault on a PI */
-    if (fault->input_index == -1 && ckt->gate[fault->gate_index].type == PI) {
-        values[fault->gate_index] = fault_val;
-        start_g = fault->gate_index + 1;
-    }
-
-    for (g = start_g; g < ckt->ngates; g++) {
-        gate = &ckt->gate[g];
-
-        switch (gate->type) {
-            case PI:
-                /* PIs already copied from good_values */
-                break;
-
-            case PO_GND:
-                values[g] = LOGIC_0;
-                if (g == fault->gate_index && fault->input_index == -1) {
-                    values[g] = fault_val;
-                }
-                break;
-
-            case PO_VCC:
-                values[g] = LOGIC_1;
-                if (g == fault->gate_index && fault->input_index == -1) {
-                    values[g] = fault_val;
-                }
-                break;
-
-            case INV:
-            case BUF:
-            case PO:
-                a = values[gate->fanin[0]];
-
-                if (g == fault->gate_index && fault->input_index == 0) {
-                    a = fault_val;
-                }
-
-                if (gate->type == PO) {
-                    values[g] = a;
-                } else {
-                    values[g] = eval_gate(gate->type, a, LOGIC_X);
-                }
-
-                if (g == fault->gate_index && fault->input_index == -1) {
-                    values[g] = fault_val;
-                }
-                break;
-
-            case AND:
-            case OR:
-            case NAND:
-            case NOR:
-                a = values[gate->fanin[0]];
-                b = values[gate->fanin[1]];
-
-                if (g == fault->gate_index) {
-                    if (fault->input_index == 0) a = fault_val;
-                    if (fault->input_index == 1) b = fault_val;
-                }
-
-                values[g] = eval_gate(gate->type, a, b);
-
-                if (g == fault->gate_index && fault->input_index == -1) {
-                    values[g] = fault_val;
-                }
-                break;
-
-            default:
-                break;
-        }
-    }
-}
-
-static inline int fault_cannot_be_detected_on_pattern(circuit_t *ckt, int *good_values, fault_list_t *fault) {
-    int gate_idx = fault->gate_index;
-    int input_idx = fault->input_index;
-    int stuck_val = stuck_to_logic(fault->type);
-    gate_t *gate = &ckt->gate[gate_idx];
-
-    /* Check 1: fault not activated */
-    if (input_idx == -1) {
-        if (good_values[gate_idx] == stuck_val) {
-            return TRUE;
-        }
-    } else {
-        int fault_line_val = good_values[gate->fanin[input_idx]];
-        if (fault_line_val == stuck_val) {
-            return TRUE;
-        }
-
-        /* Check 2: controlling value on the other input blocks propagation */
-        if ((gate->type == AND || gate->type == NAND ||
-             gate->type == OR  || gate->type == NOR) && (input_idx == 0 || input_idx == 1)) {
-
-            int other_idx = gate->fanin[1 - input_idx];
-            int other_val = good_values[other_idx];
-
-            if ((gate->type == AND || gate->type == NAND) && other_val == LOGIC_0) {
-                return TRUE;
-            }
-
-            if ((gate->type == OR || gate->type == NOR) && other_val == LOGIC_1) {
-                return TRUE;
-            }
-        }
-    }
-
-    return FALSE;
-}
-
-fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
-     circuit_t *ckt;
-     pattern_t *pat;
-     fault_list_t *undetected_flist;
+fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
+    circuit_t *ckt;
+    pattern_t *pat;
+    fault_list_t *undetected_flist;
 {
-    int good_values[MAX_GATES];
-    int bad_values[MAX_GATES];
-    int p, j, detected;
+    int p, i, g, f_val;
     fault_list_t *prev, *curr, *next;
 
     for (p = 0; p < pat->len; p++) {
-        simulate_good(ckt, pat->in[p], good_values);
-
-        for (j = 0; j < ckt->npo; j++) {
-            pat->out[p][j] = good_values[ckt->po[j]];
+        /* 1. Good Simulation [cite: 8] */
+        for (i = 0; i < ckt->npi; i++) good_vals[ckt->pi[i]] = pat->in[p][i];
+        
+        for (g = 0; g < ckt->ngates; g++) {
+            gate_t *gate = &ckt->gate[g];
+            if (gate->type == PI) continue;
+            if (gate->type == PO_GND) { good_vals[g] = LOGIC_0; continue; }
+            if (gate->type == PO_VCC) { good_vals[g] = LOGIC_1; continue; }
+            
+            if (gate->type == AND || gate->type == OR || gate->type == NAND || gate->type == NOR)
+                good_vals[g] = eval_3val(gate->type, good_vals[gate->fanin[0]], good_vals[gate->fanin[1]]);
+            else
+                good_vals[g] = eval_3val(gate->type, good_vals[gate->fanin[0]], LOGIC_X);
         }
 
+        /* Store output patterns  */
+        for (i = 0; i < ckt->npo; i++) pat->out[p][i] = good_vals[ckt->po[i]];
+
+        /* 2. Fault Simulation [cite: 11, 12] */
         prev = NULL;
         curr = undetected_flist;
-
         while (curr != NULL) {
-    detected = FALSE;
-    next = curr->next;
+            next = curr->next;
+            int g_idx = curr->gate_index;
+            f_val = (curr->type == S_A_0) ? LOGIC_0 : LOGIC_1;
 
-    if (fault_cannot_be_detected_on_pattern(ckt, good_values, curr)) {
-        prev = curr;
-        curr = next;
-        continue;
-    }
+            int activated = 0;
+            int val_at_fault_site = LOGIC_X;
 
-    simulate_faulty_from_good(ckt, good_values, bad_values, curr);
+            if (curr->input_index == -1) {
+                if (good_vals[g_idx] != f_val) {
+                    activated = 1;
+                    val_at_fault_site = f_val;
+                }
+            } else {
+                gate_t *f_gate = &ckt->gate[g_idx];
+                if (good_vals[f_gate->fanin[curr->input_index]] != f_val) {
+                    activated = 1;
+                    int a = (curr->input_index == 0) ? f_val : good_vals[f_gate->fanin[0]];
+                    int b = (f_gate->type == AND || f_gate->type == OR || f_gate->type == NAND || f_gate->type == NOR) ? 
+                            ((curr->input_index == 1) ? f_val : good_vals[f_gate->fanin[1]]) : LOGIC_X;
+                    val_at_fault_site = eval_3val(f_gate->type, a, b);
+                }
+            }
 
-    for (j = 0; j < ckt->npo; j++) {
-        int po_idx = ckt->po[j];
-        int good = good_values[po_idx];
-        int bad  = bad_values[po_idx];
+            int detected = 0;
+            if (activated && val_at_fault_site != good_vals[g_idx]) {
+                faulty_vals[g_idx] = val_at_fault_site;
+                affected[g_idx] = 1;
 
-        if (good != LOGIC_X && bad != LOGIC_X && good != bad) {
-            detected = TRUE;
-            break;
-        }
-    }
+                /* Selective Trace propagation [cite: 22] */
+                for (g = g_idx + 1; g < ckt->ngates; g++) {
+                    gate_t *gate = &ckt->gate[g];
+                    affected[g] = 0; 
+                    
+                    int fanin_changed = 0;
+                    if (affected[gate->fanin[0]]) fanin_changed = 1;
+                    else if ((gate->type == AND || gate->type == OR || gate->type == NAND || gate->type == NOR) && affected[gate->fanin[1]]) 
+                        fanin_changed = 1;
+
+                    if (fanin_changed) {
+                        int a = affected[gate->fanin[0]] ? faulty_vals[gate->fanin[0]] : good_vals[gate->fanin[0]];
+                        int b = (gate->type == AND || gate->type == OR || gate->type == NAND || gate->type == NOR) ? 
+                                (affected[gate->fanin[1]] ? faulty_vals[gate->fanin[1]] : good_vals[gate->fanin[1]]) : LOGIC_X;
+                        
+                        int new_val = eval_3val(gate->type, a, b);
+                        if (new_val != good_vals[g]) {
+                            faulty_vals[g] = new_val;
+                            affected[g] = 1;
+                        }
+                    }
+                }
+
+                /* Check Primary Outputs  */
+                for (i = 0; i < ckt->npo; i++) {
+                    int po_g = ckt->po[i];
+                    if (affected[po_g] && good_vals[po_g] != LOGIC_X && faulty_vals[po_g] != LOGIC_X) {
+                        detected = 1;
+                        break;
+                    }
+                }
+                /* Reset affected flags for next fault simulation pass */
+                for (g = g_idx; g < ckt->ngates; g++) affected[g] = 0;
+            }
 
             if (detected) {
                 if (prev == NULL) undetected_flist = next;
@@ -269,14 +133,9 @@ fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
             } else {
                 prev = curr;
             }
-
             curr = next;
         }
-
-        if (undetected_flist == NULL) {
-            break;
-        }
+        if (undetected_flist == NULL) break;
     }
-
-    return(undetected_flist);
+    return undetected_flist;
 }
