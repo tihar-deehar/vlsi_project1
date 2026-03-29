@@ -183,6 +183,43 @@ static void simulate_faulty_from_good(circuit_t *ckt, int *good_values, int *val
     }
 }
 
+static inline int fault_cannot_be_detected_on_pattern(circuit_t *ckt, int *good_values, fault_list_t *fault) {
+    int gate_idx = fault->gate_index;
+    int input_idx = fault->input_index;
+    int stuck_val = stuck_to_logic(fault->type);
+    gate_t *gate = &ckt->gate[gate_idx];
+
+    /* Check 1: fault not activated */
+    if (input_idx == -1) {
+        if (good_values[gate_idx] == stuck_val) {
+            return TRUE;
+        }
+    } else {
+        int fault_line_val = good_values[gate->fanin[input_idx]];
+        if (fault_line_val == stuck_val) {
+            return TRUE;
+        }
+
+        /* Check 2: controlling value on the other input blocks propagation */
+        if ((gate->type == AND || gate->type == NAND ||
+             gate->type == OR  || gate->type == NOR) && (input_idx == 0 || input_idx == 1)) {
+
+            int other_idx = gate->fanin[1 - input_idx];
+            int other_val = good_values[other_idx];
+
+            if ((gate->type == AND || gate->type == NAND) && other_val == LOGIC_0) {
+                return TRUE;
+            }
+
+            if ((gate->type == OR || gate->type == NOR) && other_val == LOGIC_1) {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
 fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
      circuit_t *ckt;
      pattern_t *pat;
@@ -204,21 +241,27 @@ fault_list_t *three_val_fault_simulate(ckt,pat,undetected_flist)
         curr = undetected_flist;
 
         while (curr != NULL) {
-            detected = FALSE;
+    detected = FALSE;
+    next = curr->next;
 
-            simulate_faulty_from_good(ckt, good_values, bad_values, curr);
+    if (fault_cannot_be_detected_on_pattern(ckt, good_values, curr)) {
+        prev = curr;
+        curr = next;
+        continue;
+    }
 
-            for (j = 0; j < ckt->npo; j++) {
-                int good = good_values[ckt->po[j]];
-                int bad  = bad_values[ckt->po[j]];
+    simulate_faulty_from_good(ckt, good_values, bad_values, curr);
 
-                if (good != LOGIC_X && bad != LOGIC_X && good != bad) {
-                    detected = TRUE;
-                    break;
-                }
-            }
+    for (j = 0; j < ckt->npo; j++) {
+        int po_idx = ckt->po[j];
+        int good = good_values[po_idx];
+        int bad  = bad_values[po_idx];
 
-            next = curr->next;
+        if (good != LOGIC_X && bad != LOGIC_X && good != bad) {
+            detected = TRUE;
+            break;
+        }
+    }
 
             if (detected) {
                 if (prev == NULL) undetected_flist = next;
