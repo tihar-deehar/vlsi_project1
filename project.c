@@ -1,57 +1,32 @@
-/*
- * project.c — 3-Valued Bit-Parallel Fault Simulator
- *
- * Strategy:
- * ---------
- * 1. BIT-PARALLEL GOOD SIMULATION (64 patterns at once using uint64_t)
- *    3-value logic encoded as two bit-vectors per gate:
- *      LOGIC 0: V1=0, V0=1
- *      LOGIC 1: V1=1, V0=0
- *      LOGIC X: V1=0, V0=0
- *
- * 2. PRECOMPUTED FANOUT CONES
- *    Before simulation, for each gate g we build cone[g]: the sorted
- *    (topological order) list of all gates reachable from g via fanout.
- *    Fault propagation then only visits cone[g] instead of scanning every
- *    gate after g_idx, cutting propagation cost dramatically on large circuits.
- *    A flat memory pool (cone_pool) avoids per-gate malloc.
- *
- * 3. GENERATION-COUNTER VISITED TRACKING
- *    Instead of clearing an is_aff[] byte array after each fault (O(cone size)),
- *    we use a uint64_t generation counter (aff_gen[]). A gate is "affected" iff
- *    aff_gen[g] == cur_gen. No clearing loop needed.
- *
- * 4. reaches_po[] EARLY-SKIP
- *    Precomputed boolean: does this gate have any path to a primary output?
- *    Faults at gates that cannot reach any PO are skipped immediately.
- *
- * 5. SELECTIVE FAULT SIMULATION
- *    Only propagate a fault if f_mask (patterns where fault changes gate output)
- *    is non-zero. Detected faults are spliced out of the linked list in-place.
- */
-
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include "project.h"
 
-/* --------------------------------------------------------------------------
- * 3-Value Bit-Parallel Gate Macros
- * -------------------------------------------------------------------------- */
+/*************************************************************************
+
+Function:  three_val_transition_fault_simulate
+
+Purpose:  This function performs transition fault simulation on 3-valued
+          input patterns.
+
+pat.out[][] is filled with the fault-free output patterns corresponding to
+the input patterns in pat.in[][].
+
+Return:  List of faults that remain undetected.
+
+*************************************************************************/
+
 #define BP_AND(a1,a0,b1,b0,r1,r0) { (r1)=(a1)&(b1); (r0)=(a0)|(b0); }
 #define BP_OR(a1,a0,b1,b0,r1,r0)  { (r1)=(a1)|(b1); (r0)=(a0)&(b0); }
 #define BP_INV(a1,a0,r1,r0)       { (r1)=(a0);       (r0)=(a1);       }
 
-/* --------------------------------------------------------------------------
- * Static storage
- * -------------------------------------------------------------------------- */
 
-static uint64_t g_v1[MAX_GATES], g_v0[MAX_GATES]; /* good simulation */
-static uint64_t f_v1[MAX_GATES], f_v0[MAX_GATES]; /* faulty simulation */
-static uint64_t aff_gen[MAX_GATES];               /* generation counter */
+static uint64_t g_v1[MAX_GATES], g_v0[MAX_GATES]; 
+static uint64_t f_v1[MAX_GATES], f_v0[MAX_GATES]; 
+static uint64_t aff_gen[MAX_GATES];              
 
-/* Fanout cone pool — increase multiplier if pool is exhausted */
 #define CONE_POOL_SIZE (MAX_GATES * 48)
 static int  cone_pool[CONE_POOL_SIZE];
 static int *cone[MAX_GATES];
@@ -59,7 +34,6 @@ static int  cone_size[MAX_GATES];
 
 static char reaches_po[MAX_GATES];
 
-/* Scratch buffers used only during build_fanout_cones */
 #define FANOUT_POOL_SIZE (MAX_GATES * 6)
 static int  fanout_pool[FANOUT_POOL_SIZE];
 static int *fanout[MAX_GATES];
@@ -67,9 +41,6 @@ static int  fanout_cnt[MAX_GATES];
 static char in_cone[MAX_GATES];
 static int  bfs_queue[MAX_GATES];
 
-/* --------------------------------------------------------------------------
- * eval_gate — inline 3-valued gate evaluation
- * -------------------------------------------------------------------------- */
 static inline void eval_gate(gate_t *gt,
                               uint64_t a1, uint64_t a0,
                               uint64_t b1, uint64_t b0,
@@ -86,14 +57,10 @@ static inline void eval_gate(gate_t *gt,
     }
 }
 
-/* --------------------------------------------------------------------------
- * build_fanout_cones — called once before simulation begins
- * -------------------------------------------------------------------------- */
 static void build_fanout_cones(circuit_t *ckt)
 {
     int g, i, fp = 0;
 
-    /* 1. Build forward fanout lists */
     memset(fanout_cnt, 0, sizeof(int) * ckt->ngates);
     for (g = 0; g < ckt->ngates; g++) {
         gate_t *gt = &ckt->gate[g];
@@ -117,7 +84,6 @@ static void build_fanout_cones(circuit_t *ckt)
         }
     }
 
-    /* 2. Back-propagate reaches_po (gates are in topo order) */
     memset(reaches_po, 0, ckt->ngates);
     for (i = 0; i < ckt->npo; i++) reaches_po[ckt->po[i]] = 1;
     for (g = ckt->ngates - 1; g >= 0; g--) {
@@ -128,7 +94,6 @@ static void build_fanout_cones(circuit_t *ckt)
         if (gt->type <= NOR) reaches_po[gt->fanin[1]] = 1;
     }
 
-    /* 3. Build cone[g] via BFS over fanout, stored in topo order */
     memset(in_cone, 0, ckt->ngates);
     int pool_ptr = 0;
 
@@ -149,14 +114,12 @@ static void build_fanout_cones(circuit_t *ckt)
             }
         }
 
-        /* Insertion sort into topo order (gate index = topo index) */
         for (i = 1; i < tail; i++) {
             int key = bfs_queue[i], j = i - 1;
             while (j >= 0 && bfs_queue[j] > key) { bfs_queue[j+1] = bfs_queue[j]; j--; }
             bfs_queue[j+1] = key;
         }
 
-        /* Copy to pool, skipping g itself */
         int sz = 0;
         for (i = 0; i < tail; i++) {
             int node = bfs_queue[i];
@@ -168,9 +131,6 @@ static void build_fanout_cones(circuit_t *ckt)
     }
 }
 
-/* --------------------------------------------------------------------------
- * three_val_fault_simulate
- * -------------------------------------------------------------------------- */
 fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
     circuit_t    *ckt;
     pattern_t    *pat;
@@ -191,9 +151,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
         int      b_size = (pat->len - p < 64) ? (pat->len - p) : 64;
         uint64_t b_mask = (b_size == 64) ? ~0ULL : ((1ULL << b_size) - 1);
 
-        /* ------------------------------------------------------------------
-         * 1. Good simulation
-         * ------------------------------------------------------------------ */
         for (i = 0; i < ckt->npi; i++) {
             uint64_t v1 = 0, v0 = 0;
             int pi_g = ckt->pi[i];
@@ -216,7 +173,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             eval_gate(gt, a1, a0, b1, b0, &g_v1[g], &g_v0[g]);
         }
 
-        /* Store fault-free outputs */
         for (w = 0; w < b_size; w++) {
             for (i = 0; i < ckt->npo; i++) {
                 int po_g = ckt->po[i];
@@ -226,9 +182,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             }
         }
 
-        /* ------------------------------------------------------------------
-         * 2. Selective fault simulation
-         * ------------------------------------------------------------------ */
         prev = NULL;
         curr = undetected_flist;
 
@@ -238,7 +191,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
 
             if (!reaches_po[g_idx]) { prev = curr; curr = next; continue; }
 
-            /* Compute faulty value at fault site */
             uint64_t f_site_v1, f_site_v0;
 
             if (curr->input_index == -1) {
@@ -270,7 +222,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             int detected = 0;
 
             if (f_mask) {
-                /* Propagate through precomputed fanout cone */
                 cur_gen++;
                 f_v1[g_idx] = f_site_v1;
                 f_v0[g_idx] = f_site_v0;
@@ -302,7 +253,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
                     }
                 }
 
-                /* Check observability at POs */
                 uint64_t detect_mask = 0;
                 for (i = 0; i < ckt->npo; i++) {
                     int po_g = ckt->po[i];
@@ -316,7 +266,6 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             if (detected) {
                 if (prev == NULL) undetected_flist = next;
                 else              prev->next = next;
-                /* Do NOT free curr — support code frees it */
             } else {
                 prev = curr;
             }
