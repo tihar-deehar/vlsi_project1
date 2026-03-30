@@ -17,6 +17,35 @@ the input patterns in pat.in[][].
 Return:  List of faults that remain undetected.
 
 *************************************************************************/
+/*
+ * Strategy:
+ * ---------
+ * 1  Bit-parallel good simulation (64 patterns at once using uint64_t)
+ *    3-value logic encoded as two bit-vectors per gate
+ *      LOGIC 0: V1=0, V0=1
+ *      LOGIC 1: V1=1, V0=0
+ *      LOGIC X: V1=0, V0=0
+ *
+ * 2 Precomputed fanout cones
+ *    Before simulation for each gate g we build cone[g], the sorted
+ *    (topological order) list of all gates reachable from g via fanout.
+ *    Fault propagation then only visits cone[g] instead of scanning every
+ *    gate after g_idx cutting propagation cost dramatically on large circuits.
+ *    A flat memory pool (cone_pool) avoids per-gate malloc
+ *
+ * 3  Generation-based affected gate marking
+ *    Instead of clearing an is_aff[] byte array after each fault,
+ *    we use a uint64_t generation counter (aff_gen[]). A gate is "affected" iff
+ *    aff_gen[g] == cur_gen. No clearing needed
+ *
+ * 4 Reaches_po[] is early-skip
+ *    Precomputed boolean does this gate have any path to a primary output?
+ *    Faults at gates that cannot reach any PO are skipped immediately
+ *
+ * 5 Selective fault simulation
+ *    Only propagate a fault if f_mask (patterns where fault changes gate output)
+ *    is non-zero. Detected faults are spliced out of the linked list in-place
+ */
 
 #define BP_AND(a1,a0,b1,b0,r1,r0) { (r1)=(a1)&(b1); (r0)=(a0)|(b0); }
 #define BP_OR(a1,a0,b1,b0,r1,r0)  { (r1)=(a1)|(b1); (r0)=(a0)&(b0); }
