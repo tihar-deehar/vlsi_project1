@@ -47,22 +47,26 @@ Return:  List of faults that remain undetected.
  *    is non-zero. Detected faults are spliced out of the linked list in-place
  */
 
+// macros for bit-parallel 3-value gate evaluation (does 64 patterns at once)
 #define BP_AND(a1,a0,b1,b0,r1,r0) { (r1)=(a1)&(b1); (r0)=(a0)|(b0); }
 #define BP_OR(a1,a0,b1,b0,r1,r0)  { (r1)=(a1)|(b1); (r0)=(a0)&(b0); }
 #define BP_INV(a1,a0,r1,r0)       { (r1)=(a0);       (r0)=(a1);       }
 
-
+// good sim values (g_v1/g_v0), faulty sim values (f_v1/f_v0), generation stamps
 static uint64_t g_v1[MAX_GATES], g_v0[MAX_GATES]; 
 static uint64_t f_v1[MAX_GATES], f_v0[MAX_GATES]; 
 static uint64_t aff_gen[MAX_GATES];              
 
+// flat memory pool for precomputed fanout cones
 #define CONE_POOL_SIZE (MAX_GATES * 48)
 static int  cone_pool[CONE_POOL_SIZE];
 static int *cone[MAX_GATES];
 static int  cone_size[MAX_GATES];
 
+// reaches_po[g] = 1 if gate g has any path to a primary output
 static char reaches_po[MAX_GATES];
 
+// flat memory pool for fanout lists + BFS working arrays
 #define FANOUT_POOL_SIZE (MAX_GATES * 6)
 static int  fanout_pool[FANOUT_POOL_SIZE];
 static int *fanout[MAX_GATES];
@@ -70,6 +74,7 @@ static int  fanout_cnt[MAX_GATES];
 static char in_cone[MAX_GATES];
 static int  bfs_queue[MAX_GATES];
 
+// evaluating a gate here — picks the right macro based on gate type
 static inline void eval_gate(gate_t *gt,
                               uint64_t a1, uint64_t a0,
                               uint64_t b1, uint64_t b0,
@@ -86,10 +91,12 @@ static inline void eval_gate(gate_t *gt,
     }
 }
 
+// building fanout cones in 3 stages + reaches_po + BFS cone construction
 static void build_fanout_cones(circuit_t *ckt)
 {
     int g, i, fp = 0;
 
+    // stage 1: count how many fanouts each gate has
     memset(fanout_cnt, 0, sizeof(int) * ckt->ngates);
     for (g = 0; g < ckt->ngates; g++) {
         gate_t *gt = &ckt->gate[g];
@@ -97,11 +104,15 @@ static void build_fanout_cones(circuit_t *ckt)
         fanout_cnt[gt->fanin[0]]++;
         if (gt->type <= NOR) fanout_cnt[gt->fanin[1]]++;
     }
+
+    // stage 2: assign each gate a slice of the fanout pool
     for (g = 0; g < ckt->ngates; g++) {
         fanout[g] = &fanout_pool[fp];
         fp += fanout_cnt[g];
         fanout_cnt[g] = 0;
     }
+
+    // stage 3: fill in the actual fanout lists
     for (g = 0; g < ckt->ngates; g++) {
         gate_t *gt = &ckt->gate[g];
         if (gt->type == PI || gt->type == PO_GND || gt->type == PO_VCC) continue;
@@ -113,6 +124,7 @@ static void build_fanout_cones(circuit_t *ckt)
         }
     }
 
+    // computing reaches_po — walk backward from POs through fanins
     memset(reaches_po, 0, ckt->ngates);
     for (i = 0; i < ckt->npo; i++) reaches_po[ckt->po[i]] = 1;
     for (g = ckt->ngates - 1; g >= 0; g--) {
@@ -123,14 +135,17 @@ static void build_fanout_cones(circuit_t *ckt)
         if (gt->type <= NOR) reaches_po[gt->fanin[1]] = 1;
     }
 
+    // building cones — BFS from each gate through fanouts, then sort topologically
     memset(in_cone, 0, ckt->ngates);
     int pool_ptr = 0;
 
     for (g = 0; g < ckt->ngates; g++) {
+        // skip gates that can never reach a PO
         if (!reaches_po[g]) { cone[g] = NULL; cone_size[g] = 0; continue; }
 
         cone[g] = &cone_pool[pool_ptr];
 
+        // BFS from gate g following fanout edges
         int head = 0, tail = 0;
         bfs_queue[tail++] = g;
         in_cone[g] = 1;
@@ -143,12 +158,14 @@ static void build_fanout_cones(circuit_t *ckt)
             }
         }
 
+        // insertion sort by gate index = topological order
         for (i = 1; i < tail; i++) {
             int key = bfs_queue[i], j = i - 1;
             while (j >= 0 && bfs_queue[j] > key) { bfs_queue[j+1] = bfs_queue[j]; j--; }
             bfs_queue[j+1] = key;
         }
 
+        // copy sorted cone into pool, skip gate g itself, reset in_cone markers
         int sz = 0;
         for (i = 0; i < tail; i++) {
             int node = bfs_queue[i];
@@ -170,16 +187,19 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
     static uint64_t cur_gen = 0;
     static int cones_built = 0;
 
+    // build cones once on first call
     if (!cones_built) {
         build_fanout_cones(ckt);
         memset(aff_gen, 0, sizeof(uint64_t) * ckt->ngates);
         cones_built = 1;
     }
 
+    // main loop — process patterns in batches of 64
     for (p = 0; p < pat->len; p += 64) {
         int      b_size = (pat->len - p < 64) ? (pat->len - p) : 64;
         uint64_t b_mask = (b_size == 64) ? ~0ULL : ((1ULL << b_size) - 1);
 
+        // packing input patterns into bit-parallel uint64s
         for (i = 0; i < ckt->npi; i++) {
             uint64_t v1 = 0, v0 = 0;
             int pi_g = ckt->pi[i];
@@ -191,6 +211,7 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             g_v1[pi_g] = v1; g_v0[pi_g] = v0;
         }
 
+        // good (fault-free) simulation — evaluate every gate in topological order
         for (g = 0; g < ckt->ngates; g++) {
             gate_t *gt = &ckt->gate[g];
             if (gt->type == PI)     continue;
@@ -202,6 +223,7 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             eval_gate(gt, a1, a0, b1, b0, &g_v1[g], &g_v0[g]);
         }
 
+        // unpacking outputs — extract bit-parallel results back into pat->out
         for (w = 0; w < b_size; w++) {
             for (i = 0; i < ckt->npo; i++) {
                 int po_g = ckt->po[i];
@@ -211,6 +233,7 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             }
         }
 
+        // fault simulation — walk the undetected fault list
         prev = NULL;
         curr = undetected_flist;
 
@@ -218,14 +241,18 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             next = curr->next;
             int g_idx = curr->gate_index;
 
+            // early skip — if this gate cant reach any PO, dont bother
             if (!reaches_po[g_idx]) { prev = curr; curr = next; continue; }
 
             uint64_t f_site_v1, f_site_v0;
 
+            // injecting the fault — output fault or input fault
             if (curr->input_index == -1) {
+                // fault is on the gate output, force it to stuck value
                 f_site_v1 = (curr->type == S_A_1) ? b_mask : 0;
                 f_site_v0 = (curr->type == S_A_0) ? b_mask : 0;
             } else {
+                // fault is on a gate input, force that input and re-evaluate
                 gate_t *fg = &ckt->gate[g_idx];
                 uint64_t a1, a0, b1 = 0, b0 = 0;
                 if (curr->input_index == 0) {
@@ -245,12 +272,14 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
                 eval_gate(fg, a1, a0, b1, b0, &f_site_v1, &f_site_v0);
             }
 
+            // checking if fault actually changes anything on any pattern
             uint64_t f_mask = ((f_site_v1 ^ g_v1[g_idx]) |
                                (f_site_v0 ^ g_v0[g_idx])) & b_mask;
 
             int detected = 0;
 
             if (f_mask) {
+                // fault matters — bump generation, mark fault site as affected
                 cur_gen++;
                 f_v1[g_idx] = f_site_v1;
                 f_v0[g_idx] = f_site_v0;
@@ -259,13 +288,17 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
                 int *cone_g = cone[g_idx];
                 int  cone_n = cone_size[g_idx];
 
+                // propagating fault through the cone in topological order
                 for (int ci = 0; ci < cone_n; ci++) {
                     int gc = cone_g[ci];
                     gate_t *gt = &ckt->gate[gc];
+
+                    // generation-based check — is either fanin affected this round?
                     int aff0 = (aff_gen[gt->fanin[0]] == cur_gen);
                     int aff1 = (gt->type <= NOR) && (aff_gen[gt->fanin[1]] == cur_gen);
                     if (!aff0 && !aff1) continue;
 
+                    // use faulty value if fanin affected, good value otherwise
                     uint64_t a1 = aff0 ? f_v1[gt->fanin[0]] : g_v1[gt->fanin[0]];
                     uint64_t a0 = aff0 ? f_v0[gt->fanin[0]] : g_v0[gt->fanin[0]];
                     uint64_t b1 = 0, b0 = 0;
@@ -276,12 +309,14 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
                     uint64_t res1, res0;
                     eval_gate(gt, a1, a0, b1, b0, &res1, &res0);
 
+                    // if faulty result differs from good, mark this gate affected
                     if (((res1 ^ g_v1[gc]) | (res0 ^ g_v0[gc])) & b_mask) {
                         f_v1[gc] = res1; f_v0[gc] = res0;
                         aff_gen[gc] = cur_gen;
                     }
                 }
 
+                // checking POs — did the fault propagate to any primary output?
                 uint64_t detect_mask = 0;
                 for (i = 0; i < ckt->npo; i++) {
                     int po_g = ckt->po[i];
@@ -292,6 +327,7 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
                 if (detect_mask & b_mask) detected = 1;
             }
 
+            // splicing detected faults out of the linked list
             if (detected) {
                 if (prev == NULL) undetected_flist = next;
                 else              prev->next = next;
@@ -301,6 +337,7 @@ fault_list_t *three_val_fault_simulate(ckt, pat, undetected_flist)
             curr = next;
         }
 
+        // early exit if all faults detected
         if (undetected_flist == NULL) break;
     }
 
